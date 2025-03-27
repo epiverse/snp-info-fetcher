@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>SNP Information Fetcher</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            line-height: 1.5;
+        }
+
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-top: 15px;
+        }
+
+        th,
+        td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+            font-size: 0.9em;
+            /* Smaller font for more columns */
+        }
+
+        th {
+            background-color: #f2f2f2;
+            position: sticky;
+            top: 0;
+            /* Keep header visible */
+        }
+
+        pre {
+            background-color: #eee;
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+
+        .loading {
+            font-style: italic;
+            color: #555;
+        }
+
+        label {
+            margin-right: 5px;
+        }
+
+        button {
+            padding: 8px 15px;
+            margin-top: 10px;
+            cursor: pointer;
+        }
+
+        #downloadBtn {
+            margin-left: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+        }
+
+        #downloadBtn:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+
+        .build-options label {
+            margin-right: 15px;
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        /* Prevent text wrap in table cells */
+        td,
+        th {
+            white-space: nowrap;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>SNP Information Fetcher</h1>
+
+    <div class="input-group">
+        <label for="rsidsInput">Enter rsIDs (comma-separated):</label><br>
+        <textarea id="rsidsInput" rows="4"
+            cols="60">rs6983267, rs10993994, rs2981582, rs16969968, rs4939827, rs_does_not_exist, rs2736100, rs1447295, rs766173, rs889312</textarea>
+    </div>
+
+    <div class="input-group build-options">
+        <span>Genome Build:</span>
+        <label><input type="radio" name="genomeBuild" value="GRCh38" checked> GRCh38</label>
+        <label><input type="radio" name="genomeBuild" value="GRCh37"> GRCh37</label>
+    </div>
+
+    <div class="input-group">
+        <label for="populationSelect">Select Population for Frequencies:</label>
+        <select id="populationSelect">
+            <option value="1000GENOMES:phase_3:ALL" selected>1000G Phase 3: ALL</option>
+            <option value="1000GENOMES:phase_3:EUR">1000G Phase 3: European (EUR)</option>
+            <option value="1000GENOMES:phase_3:AFR">1000G Phase 3: African (AFR)</option>
+            <option value="1000GENOMES:phase_3:EAS">1000G Phase 3: East Asian (EAS)</option>
+            <option value="1000GENOMES:phase_3:SAS">1000G Phase 3: South Asian (SAS)</option>
+            <option value="1000GENOMES:phase_3:AMR">1000G Phase 3: American (AMR)</option>
+            <option value="TOPMed">TOPMed: ALL</option>
+            <option value="gnomADg:ALL">gnomAD genomes v4.1: ALL</option>
+            <option value="gnomADg:afr">gnomAD genomes v4.1: African/African American</option>
+            <option value="gnomADg:ami">gnomAD genomes v4.1: Amish</option>
+            <option value="gnomADg:amr">gnomAD genomes v4.1: Latino/Admixed American</option>
+            <option value="gnomADg:asj">gnomAD genomes v4.1: Ashkenazi Jewish</option>
+            <option value="gnomADg:eas">gnomAD genomes v4.1: East Asian</option>
+            <option value="gnomADg:fin">gnomAD genomes v4.1: Finnish</option>
+            <option value="gnomADg:mid">gnomAD genomes v4.1: Middle Eastern</option>
+            <option value="gnomADg:nfe">gnomAD genomes v4.1: Non-Finnish European</option>
+            <option value="gnomADg:remaining">gnomAD genomes v4.1: Remaining</option>
+            <option value="gnomADg:sas">gnomAD genomes v4.1: South Asian</option>
+        </select>
+    </div>
+
+    <button onclick="fetchAndDisplaySnpData()">Fetch Data</button>
+    <button id="downloadBtn" onclick="downloadJson()" disabled>Download JSON</button>
+
+    <div id="results">
+        <h2>Results</h2>
+        <p id="status" class="loading">Enter rsIDs, select options, and click 'Fetch Data'.</p>
+        <div style="overflow-x: auto;">
+            <table id="resultsTable" style="display:none;">
+                <thead>
+                    <tr>
+                        <th>rsID</th>
+                        <th>Chromosome</th>
+                        <th>Position</th>
+                        <th>Build</th>
+                        <th>Reference Allele</th>
+                        <th>Ref Allele Freq</th>
+                        <th>Alternate Allele(s)</th>
+                        <th>Alt Allele Freq(s)</th>
+                        <th>Minor Allele (Pop)</th>
+                        <th>MAF (Pop)</th>
+                        <th>Population Queried</th>
+                        <th>Error</th>
+                    </tr>
+                </thead>
+                <tbody id="resultsBody">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        const ENSEMBL_API_BASE = "https://rest.ensembl.org";
+        const VARIATION_ENDPOINT = "/variation/human/";
+
+        // --- Global variable to store results for download ---
+        let currentResultsData = [];
+
+        // --- Elements ---
+        const rsidsInput = document.getElementById('rsidsInput');
+        const populationSelect = document.getElementById('populationSelect');
+        const resultsTable = document.getElementById('resultsTable');
+        const resultsBody = document.getElementById('resultsBody');
+        const statusElement = document.getElementById('status');
+        const downloadBtn = document.getElementById('downloadBtn');
+
+        /**
+         * Fetches data for a single rsID from Ensembl.
+         * @param {string} rsid - The rsID to query.
+         * @param {string} targetPopulation - The population code.
+         * @param {string} targetBuild - The target genome build ('GRCh37' or 'GRCh38').
+         * @returns {Promise<object>} - A promise that resolves with the SNP data or an error object.
+         */
+        async function fetchSnpData(rsid, targetPopulation, targetBuild) {
+            const url = `${ENSEMBL_API_BASE}${VARIATION_ENDPOINT}${rsid}?pops=1`;
+            const headers = { "Content-Type": "application/json" };
+
+            // Initialize returned result structure
+            const resultTemplate = {
+                rsid: rsid,
+                chromosome: 'N/A',
+                position: 'N/A',
+                build: targetBuild,
+                ref_allele: 'N/A',
+                ref_allele_freq: 'N/A',
+                alt_alleles_list: [],
+                alt_alleles_display: 'N/A',
+                alt_allele_freqs: {},
+                minor_allele: 'N/A',
+                maf: 'N/A',
+                population: targetPopulation,
+                error: null
+            };
+
+            try {
+                const response = await fetch(url, { headers: headers });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}. ${errorText}`);
+                }
+
+                const data = await response.json();
+                const currentResult = { ...resultTemplate };
+                currentResult.alt_allele_freqs = {};
+
+                // --- Extract Location and Alleles for the target build ---
+                let mappingFound = false;
+                let sourceMapping = null;
+
+                if (data.mappings && data.mappings.length > 0) {
+                    const targetMapping = data.mappings.find(m => m.assembly_name === targetBuild);
+
+                    if (targetMapping) {
+                        currentResult.chromosome = targetMapping.seq_region_name || 'N/A';
+                        currentResult.position = targetMapping.start || 'N/A';
+                        mappingFound = true;
+                        sourceMapping = targetMapping;
+                    } else {
+                        currentResult.chromosome = `N/A (${targetBuild})`;
+                        currentResult.position = `N/A (${targetBuild})`;
+                        sourceMapping = data.mappings[0];
+                    }
+
+                    if (sourceMapping && sourceMapping.allele_string) {
+                        const alleleString = sourceMapping.allele_string;
+                        if (alleleString && alleleString.includes('/')) {
+                            const alleles = alleleString.split('/');
+                            currentResult.ref_allele = alleles[0];
+                            currentResult.alt_alleles_list = alleles.slice(1);
+                            currentResult.alt_alleles_display = currentResult.alt_alleles_list.join(', ') || 'N/A';
+                        } else if (alleleString) {
+                            currentResult.ref_allele = alleleString; // Indel or single allele?
+                            currentResult.alt_alleles_list = [];
+                            currentResult.alt_alleles_display = 'N/A';
+                        }
+                    }
+                } else {
+                    currentResult.chromosome = 'N/A (No mapping)';
+                    currentResult.position = 'N/A (No mapping)';
+                }
+
+                // Fallback for ref allele if still not found
+                if (currentResult.ref_allele === 'N/A' && data.ancestral_allele) {
+                    currentResult.ref_allele = data.ancestral_allele;
+                }
+
+                // --- Extract Frequencies for the target population ---
+                let foundPopulationData = false;
+                if (data.populations && data.populations.length > 0) {
+                    const popAlleleFreqs = data.populations
+                        .filter(p => p.population === targetPopulation)
+                        .map(p => ({ allele: p.allele, frequency: parseFloat(p.frequency) }))
+                        .filter(p => !isNaN(p.frequency) && p.allele !== '-');
+
+                    if (popAlleleFreqs.length > 0) {
+                        foundPopulationData = true;
+                        let minFreq = 1.1;
+                        let currentMinorAllele = 'N/A';
+
+                        popAlleleFreqs.forEach(popAllele => {
+                            const freqStr = popAllele.frequency.toFixed(5);
+
+                            // -- Store Ref Allele Freq --
+                            if (popAllele.allele === currentResult.ref_allele) {
+                                currentResult.ref_allele_freq = freqStr;
+                            }
+                            // -- Store Alt Allele Freqs --
+                            if (currentResult.alt_alleles_list.includes(popAllele.allele)) {
+                                currentResult.alt_allele_freqs[popAllele.allele] = freqStr;
+                            }
+
+                            // -- Find Minor Allele and MAF (Lowest Freq > 0) --
+                            if (popAllele.frequency > 0 && popAllele.frequency < minFreq) {
+                                minFreq = popAllele.frequency;
+                                currentMinorAllele = popAllele.allele;
+                            }
+                        });
+
+                        // Finalize MAF/Minor Allele assignment
+                        if (currentMinorAllele !== 'N/A') {
+                            currentResult.maf = minFreq.toFixed(5);
+                            currentResult.minor_allele = currentMinorAllele;
+                        } else if (popAlleleFreqs.some(p => p.frequency === 0)) {
+                            currentResult.maf = '0.00000';
+                            currentResult.minor_allele = popAlleleFreqs.find(p => p.frequency > 0)?.allele || 'N/A (Monomorphic)';
+                        } else {
+                            currentResult.maf = 'No data > 0';
+                            currentResult.minor_allele = 'N/A';
+                        }
+
+                        // -- Check for Missing Frequencies --
+                        // Check Ref Freq
+                        if (currentResult.ref_allele !== 'N/A' && currentResult.ref_allele_freq === 'N/A') {
+                            currentResult.ref_allele_freq = 'N/A (Not Found)';
+                        }
+                        // Check Alt Freqs
+                        currentResult.alt_alleles_list.forEach(alt => {
+                            if (!(alt in currentResult.alt_allele_freqs)) {
+                                currentResult.alt_allele_freqs[alt] = 'N/A (Not Found)';
+                            }
+                        });
+
+                    }
+                }
+
+                if (!foundPopulationData) {
+                    currentResult.ref_allele_freq = 'N/A (Pop not found)';
+                    currentResult.alt_allele_freqs = {}; // Empty
+                    currentResult.maf = 'N/A (Pop not found)';
+                    currentResult.minor_allele = 'N/A (Pop not found)';
+                }
+
+                delete currentResult.alt_alleles_list;
+
+                return currentResult;
+
+            } catch (error) {
+                console.error(`Error fetching data for ${rsid}:`, error);
+                const errorResult = { ...resultTemplate, error: error.message };
+                delete errorResult.alt_alleles_list;
+                errorResult.alt_allele_freqs = {};
+                return errorResult;
+            }
+        }
+
+        /**
+         * Parses input, triggers fetches, and displays results in the table.
+         */
+        async function fetchAndDisplaySnpData() {
+            const inputText = rsidsInput.value.trim();
+            const targetPopulation = populationSelect.value;
+            const targetBuild = document.querySelector('input[name="genomeBuild"]:checked').value;
+
+            // Basic input validation
+            if (!inputText) { /* ... existing validation ... */ return; }
+            const rsids = inputText.split(',').map(id => id.trim()).filter(id => id.length > 0);
+            if (rsids.length === 0) { /* ... existing validation ... */ return; }
+
+            // --- UI Update & Fetch ---
+            resultsBody.innerHTML = '';
+            statusElement.textContent = `Workspaceing data for ${rsids.length} SNP(s)... (Build: ${targetBuild}, Pop: ${targetPopulation})`;
+            statusElement.className = 'loading';
+            resultsTable.style.display = 'none';
+            downloadBtn.disabled = true;
+            currentResultsData = [];
+
+            const fetchPromises = rsids.map(id => fetchSnpData(id, targetPopulation, targetBuild));
+
+            try {
+                const results = await Promise.all(fetchPromises);
+                currentResultsData = results; // Store for download
+
+                if (currentResultsData.length > 0) {
+                    resultsTable.style.display = '';
+                    results.forEach(result => {
+                        const row = resultsBody.insertRow();
+                        // Populate cells in order of the header
+                        row.insertCell().textContent = result.rsid;
+                        row.insertCell().textContent = result.chromosome;
+                        row.insertCell().textContent = result.position;
+                        row.insertCell().textContent = result.build;
+                        row.insertCell().textContent = result.ref_allele;
+                        row.insertCell().textContent = result.ref_allele_freq;
+                        row.insertCell().textContent = result.alt_alleles_display;
+                        // Format alt_allele_freqs object for display
+                        const altFreqsCell = row.insertCell();
+                        altFreqsCell.textContent = Object.entries(result.alt_allele_freqs)
+                            .map(([allele, freq]) => `${allele}: ${freq}`)
+                            .join('; ') || 'N/A';
+                        row.insertCell().textContent = result.minor_allele;
+                        row.insertCell().textContent = result.maf;
+                        row.insertCell().textContent = result.population;
+                        // Error cell
+                        const errorCell = row.insertCell();
+                        errorCell.textContent = result.error || '';
+                        if (result.error) { errorCell.classList.add('error'); }
+                    });
+                    statusElement.textContent = `Workspaceed data for ${results.length} SNP(s).`;
+                    statusElement.className = '';
+                    downloadBtn.disabled = false;
+                } else {
+                    statusElement.textContent = 'No results returned.';
+                    statusElement.className = '';
+                    resultsTable.style.display = 'none';
+                    downloadBtn.disabled = true;
+                }
+            } catch (error) {
+                console.error("Error during Promise.all:", error);
+                statusElement.textContent = 'An unexpected error occurred while fetching data batch.';
+                statusElement.className = 'error';
+                downloadBtn.disabled = true;
+                currentResultsData = [];
+            }
+        }
+
+        /**
+         * Downloads the current results data as a JSON file.
+         */
+        function downloadJson() {
+            if (!currentResultsData || currentResultsData.length === 0) {
+                alert("No data available to download.");
+                return;
+            }
+
+            try {
+                const jsonString = JSON.stringify(currentResultsData, null, 2);
+                const blob = new Blob([jsonString], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                const date = new Date();
+                const timestamp = `${date.getFullYear()}${(date.getMonth() + 1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}_${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
+                a.download = `snp_data_${timestamp}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            } catch (error) {
+                console.error("Error creating or downloading JSON file:", error);
+                alert("Failed to download JSON data. See console for details.");
+            }
+        }
+
+        // --- Event Listeners ---
+        rsidsInput.addEventListener('keypress', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); fetchAndDisplaySnpData(); }
+        });
+
+    </script>
+
+</body>
+
+</html>
