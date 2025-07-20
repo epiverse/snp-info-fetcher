@@ -346,7 +346,7 @@
 
             // --- UI Update & Fetch ---
             resultsBody.innerHTML = '';
-            statusElement.textContent = `Workspaceing data for ${rsids.length} SNP(s)... (Build: ${targetBuild}, Pop: ${targetPopulation})`;
+            statusElement.textContent = `Fetching data for ${rsids.length} SNP(s)... (Build: ${targetBuild}, Pop: ${targetPopulation})`;
             statusElement.className = 'loading';
             resultsTable.style.display = 'none';
             downloadBtn.disabled = true;
@@ -383,7 +383,7 @@
                         errorCell.textContent = result.error || '';
                         if (result.error) { errorCell.classList.add('error'); }
                     });
-                    statusElement.textContent = `Workspaceed data for ${results.length} SNP(s).`;
+                    statusElement.textContent = `Fetched data for ${results.length} SNP(s).`;
                     statusElement.className = '';
                     downloadBtn.disabled = false;
                 } else {
