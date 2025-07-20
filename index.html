@@ -159,6 +159,8 @@
         // --- Configuration ---
         const ENSEMBL_API_BASE = "https://rest.ensembl.org";
         const VARIATION_ENDPOINT = "/variation/human/";
+        const currentBuild = () => document.querySelector('input[name="genomeBuild"]:checked').value;
+
 
         // --- Global variable to store results for download ---
         let currentResultsData = [];
@@ -337,7 +339,7 @@
         async function fetchAndDisplaySnpData() {
             const inputText = rsidsInput.value.trim();
             const targetPopulation = populationSelect.value;
-            const targetBuild = document.querySelector('input[name="genomeBuild"]:checked').value;
+            const targetBuild = currentBuild();
 
             // Basic input validation
             if (!inputText) { /* ... existing validation ... */ return; }
