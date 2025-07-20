@@ -159,6 +159,7 @@
         // --- Configuration ---
         const ENSEMBL_API_BASE = "https://rest.ensembl.org";
         const VARIATION_ENDPOINT = "/variation/human/";
+        const MAX_CONCURRENCY = 10; // Limit concurrent requests under Ensembl's 15 req/s limit
         const currentBuild = () => document.querySelector('input[name="genomeBuild"]:checked').value;
 
 
@@ -172,6 +173,39 @@
         const resultsBody = document.getElementById('resultsBody');
         const statusElement = document.getElementById('status');
         const downloadBtn = document.getElementById('downloadBtn');
+
+        // Helpers
+        async function pool(tasks, limit = MAX_CONCURRENCY) {
+            const running = [];
+            const results = [];
+
+            for (const t of tasks) {
+                const p = t().then(r => {
+                    running.splice(running.indexOf(p), 1);
+                    return r;
+                });
+
+                results.push(p);
+                running.push(p);
+
+                if (running.length >= limit) await Promise.race(running);
+            }
+
+            return Promise.all(results);
+        }
+
+        async function fetchRetry(url, options = {}, retries = 3, backoff = 800) {
+            try {
+                const r = await fetch(url, options);
+                if ([429, 503].includes(r.status)) throw new Error("retryable");
+                if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+                return r;
+            } catch (e) {
+                if (retries === 0) throw e;
+                await new Promise(res => setTimeout(res, backoff));
+                return fetchRetry(url, options, retries - 1, backoff * 2);
+            }
+        }
 
         /**
          * Fetches data for a single rsID from Ensembl.
@@ -202,7 +236,7 @@
             };
 
             try {
-                const response = await fetch(url, { headers: headers });
+                const response = await fetchRetry(url, { headers });
 
                 if (!response.ok) {
                     const errorText = await response.text();
@@ -354,10 +388,10 @@
             downloadBtn.disabled = true;
             currentResultsData = [];
 
-            const fetchPromises = rsids.map(id => fetchSnpData(id, targetPopulation, targetBuild));
+            const tasks = rsids.map(id => () => fetchSnpData(id, targetPopulation, targetBuild));
 
             try {
-                const results = await Promise.all(fetchPromises);
+                const results = await pool(tasks);
                 currentResultsData = results; // Store for download
 
                 if (currentResultsData.length > 0) {
