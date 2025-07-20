@@ -170,7 +170,8 @@
 
     <script>
         // Configuration
-        const ENSEMBL_API_BASE = "https://rest.ensembl.org";
+        const API_BASE_38 = "https://rest.ensembl.org";
+        const API_BASE_37 = "https://grch37.rest.ensembl.org";
         const VARIATION_ENDPOINT = "/variation/human/";
         const MAX_CONCURRENCY = 10; // Limit concurrent requests under Ensembl's 15 req/s limit
         const MAX_IDS_PER_POST = 200; // POST /variation batch size
@@ -190,6 +191,14 @@
         const downloadBtn = document.getElementById('downloadBtn');
 
         // Helpers
+        /**
+         * Returns the base API URL based on the selected genome build.
+         * @returns {string} - The API base URL for the current build.
+         */
+        function apiBase() {
+            return currentBuild() === "GRCh37" ? API_BASE_37 : API_BASE_38;
+        }
+
         /**
          * Executes a pool of tasks with a concurrency limit.
          * @param {Array<Function>} tasks - Array of functions returning promises.
@@ -259,7 +268,7 @@
          * to that position, or null.
          */
         async function coordToRsID({chr, pos}, build) {
-            const url = `${ENSEMBL_API_BASE}/overlap/region/human/${chr}:${pos}-${pos}?feature=variation`;
+            const url = `${apiBase()}/overlap/region/human/${chr}:${pos}-${pos}?feature=variation`;
             try {
                 const json = await fetchRetry(url, {headers: {Accept: 'application/json'}})
                     .then(r => r.json());
@@ -280,7 +289,7 @@
          *      "rs456": {...}, …}`
          */
         async function fetchVariationBatch(rsidArr, population) {
-            const url = `${ENSEMBL_API_BASE}${VARIATION_ENDPOINT}?pops=1`;
+            const url = `${apiBase()}${VARIATION_ENDPOINT}?pops=1`;
             const body = JSON.stringify({ ids: rsidArr });
 
             const response = await fetchRetry(
