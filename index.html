@@ -94,9 +94,18 @@
     <h1>SNP Information Fetcher</h1>
 
     <div class="input-group">
+        <label><input type="radio" name="inputMode" value="rsid" checked> rsID list</label>
+        <label><input type="radio" name="inputMode" value="coord"> Chromosome & position list</label>
+    </div>
+
+    <div class="input-group">
         <label for="rsidsInput">Enter rsIDs (comma-separated):</label><br>
-        <textarea id="rsidsInput" rows="4"
-            cols="60">rs6983267, rs10993994, rs2981582, rs16969968, rs4939827, rs00000, rs2736100, rs1447295, rs766173, rs889312</textarea>
+        <textarea id="rsidsInput" rows="4" cols="60">rs6983267, rs10993994, rs2981582, rs16969968, rs4939827, rs00000, rs2736100, rs1447295, rs766173, rs889312</textarea>
+    </div>
+
+    <div class="input-group" style="display:none">
+        <label for="coordsInput">Enter chr:pos list (comma, space, or newline separated):</label><br>
+        <textarea id="coordsInput" rows="4" cols="60">8:127401060, 10:46046326, 10:121592803, 15:78590583, 18:48927093, X-1000000, 5:1286401, 8:127472793, 13:32332343, 5:56736057</textarea>
     </div>
 
     <div class="input-group build-options">
@@ -160,19 +169,20 @@
     </div>
 
     <script>
-        // --- Configuration ---
+        // Configuration
         const ENSEMBL_API_BASE = "https://rest.ensembl.org";
         const VARIATION_ENDPOINT = "/variation/human/";
         const MAX_CONCURRENCY = 10; // Limit concurrent requests under Ensembl's 15 req/s limit
         const MAX_IDS_PER_POST = 200; // POST /variation batch size
         const currentBuild = () => document.querySelector('input[name="genomeBuild"]:checked').value;
 
-
-        // --- Global variable to store results for download ---
+        // Global variable to store results for download
         let currentResultsData = [];
 
-        // --- Elements ---
+        // DOM Elements
         const rsidsInput = document.getElementById('rsidsInput');
+        const coordsInput = document.getElementById('coordsInput');
+        const inputModeRadios = document.querySelectorAll('input[name="inputMode"]');
         const populationSelect = document.getElementById('populationSelect');
         const resultsTable = document.getElementById('resultsTable');
         const resultsBody = document.getElementById('resultsBody');
@@ -225,6 +235,42 @@
                 return fetchRetry(url, options, retries - 1, backoff * 2);
             }
         }
+
+        /**
+         * Turns a free‑form list like “chr1:55516888, 8 128413305” into
+         * `[{chr:"1",pos:55516888}, {chr:"8",pos:128413305}]`
+         */
+        function parseCoordTokens(text) {
+            const TOKEN_RE =
+                /^(?:chr)?([0-9]{1,2}|[XY]|MT)[:\- ]+([0-9]+)$/i;
+
+            return text
+                .split(/[\s,;]+/)
+                .map(tok => {
+                    const m = tok.match(TOKEN_RE);
+                    return m ? {chr: m[1].toUpperCase(), pos: Number(m[2])} : null;
+                })
+                .filter(Boolean);
+        }
+
+
+        /**
+         * Queries Ensembl overlap/region API for a single coordinate and returns the *first* rsID that maps exactly
+         * to that position, or null.
+         */
+        async function coordToRsID({chr, pos}, build) {
+            const url = `${ENSEMBL_API_BASE}/overlap/region/human/${chr}:${pos}-${pos}?feature=variation`;
+            try {
+                const json = await fetchRetry(url, {headers: {Accept: 'application/json'}})
+                    .then(r => r.json());
+                return json
+                    .filter(v => v.start === pos && v.id)
+                    .map(v => v.id);
+            } catch {
+                return [];
+            }
+        }
+
 
         /**
          * Fetches SNP data for a batch of rsIDs from Ensembl.
@@ -355,98 +401,119 @@
          * response through the mapping function, and renders results in the table.
          */
         async function fetchAndDisplaySnpData() {
-            const inputText = rsidsInput.value.trim();
+            const mode = [...inputModeRadios].find(r => r.checked).value; // 'rsid' | 'coord'
             const targetPopulation = populationSelect.value;
-            const targetBuild = document.querySelector('input[name="genomeBuild"]:checked').value;
+            const targetBuild = currentBuild();
 
-            // Basic input validation
-            if (!inputText) {
-                alert("Please enter at least one rsID.");
-                return;
+            // Collect rsIDs
+            let rsids = [];
+
+            if (mode === 'rsid') {
+                const raw = rsidsInput.value.trim();
+                if (!raw) {
+                    alert('Please enter at least one rsID.');
+                    return;
+                }
+
+                rsids = raw.split(/[\s,;\n]+/)
+                    .filter(t => /^rs\d+$/i.test(t.trim()));
+            } else { // mode === 'coord'
+                const coords = parseCoordTokens(coordsInput.value);
+                if (coords.length === 0) {
+                    alert('No valid coordinates found.');
+                    return;
+                }
+
+                // Resolve each coordinate to an rsID with bounded concurrency
+                const tasks = coords.map(c => () => coordToRsID(c, targetBuild));
+                rsids = (await pool(tasks)).flat().filter(Boolean);
             }
-            let rsids = inputText.split(',')
-                .map(id => id.trim())
-                .filter(id => id.length > 0 && /^rs\d+$/i.test(id));
 
             if (rsids.length === 0) {
-                alert("No valid rsIDs found.");
+                alert('No resolvable rsIDs found.');
                 return;
             }
 
-            // UI reset
+            // De‑duplicate while keeping order
+            rsids = [...new Set(rsids)];
+
+            // UI prep
             resultsBody.innerHTML = '';
-            statusElement.textContent = `Fetching data for ${rsids.length} SNP(s)... (Build ${targetBuild}, Pop ${targetPopulation})`;
+            statusElement.textContent =
+                `Fetching data for ${rsids.length} SNP(s)... (Build ${targetBuild}, Population ${targetPopulation})`;
             statusElement.className = 'loading';
             resultsTable.style.display = 'none';
             downloadBtn.disabled = true;
             currentResultsData = [];
 
-            // De‑duplicate & chunk
-            rsids = [...new Set(rsids)]; // keep original order
+            // Batch POST calls
             const chunks = [];
             for (let i = 0; i < rsids.length; i += MAX_IDS_PER_POST) {
                 chunks.push(rsids.slice(i, i + MAX_IDS_PER_POST));
             }
 
-            // Batched POST calls
-            const batchTasks = chunks.map(ch => () => fetchVariationBatch(ch, targetPopulation));
+            const batchTasks = chunks.map(chunk => () =>
+                fetchVariationBatch(chunk, targetPopulation)
+            );
+
             let batchJsons;
             try {
-                batchJsons = await pool(batchTasks); // uses the pool() helper
+                batchJsons = await pool(batchTasks);  // bounded concurrency
             } catch (e) {
-                console.error("Error during batched fetch:", e);
+                console.error('Error during batched fetch:', e);
                 statusElement.textContent = 'Batch request failed. See console.';
                 statusElement.className = 'error';
                 return;
             }
 
-            // Flatten & transform
-            const variationDict = Object.assign({}, ...batchJsons); // merge all batches
+            // Flatten, map, and render
+            const variationDict = Object.assign({}, ...batchJsons);
             const results = rsids.map(id =>
                 mapVariationToDisplay(id, variationDict[id], targetPopulation, targetBuild)
             );
 
-            // Render
-            currentResultsData = results; // for download
-
-            if (results.length > 0) {
-                resultsTable.style.display = '';
-                results.forEach(res => {
-                    const row = resultsBody.insertRow();
-
-                    if (res.error) row.classList.add('error-row');
-
-                    row.insertCell().textContent = res.rsid;
-                    row.insertCell().textContent = res.chromosome;
-                    row.insertCell().textContent = res.position;
-                    row.insertCell().textContent = res.build;
-                    row.insertCell().textContent = res.ref_allele;
-                    row.insertCell().textContent = res.ref_allele_freq;
-
-                    row.insertCell().textContent = res.alt_alleles_display;
-
-                    const altFreqsCell = row.insertCell();
-                    altFreqsCell.textContent = Object.entries(res.alt_allele_freqs)
-                        .map(([a, f]) => `${a}: ${f}`)
-                        .join('; ') || 'N/A';
-
-                    row.insertCell().textContent = res.minor_allele;
-                    row.insertCell().textContent = res.maf;
-                    row.insertCell().textContent = res.population;
-
-                    const errCell = row.insertCell();
-                    errCell.textContent = res.error || '';
-                    if (res.error) errCell.classList.add('error');
-                });
-
-                statusElement.textContent = `Fetched ${results.length} unique variant${results.length > 1 ? 's' : ''}.`;
-                statusElement.className = '';
-                downloadBtn.disabled = false;
-            } else {
+            if (results.length === 0) {
                 statusElement.textContent = 'No results returned.';
                 statusElement.className = '';
+                return;
             }
+
+            currentResultsData = results;
+
+            // Build the table rows
+            resultsTable.style.display = '';
+            results.forEach(res => {
+                const row = resultsBody.insertRow();
+                if (res.error) row.classList.add('error-row');
+
+                row.insertCell().textContent = res.rsid;
+                row.insertCell().textContent = res.chromosome;
+                row.insertCell().textContent = res.position;
+                row.insertCell().textContent = res.build;
+                row.insertCell().textContent = res.ref_allele;
+                row.insertCell().textContent = res.ref_allele_freq;
+                row.insertCell().textContent = res.alt_alleles_display;
+
+                const altFreqs = Object.entries(res.alt_allele_freqs)
+                    .map(([a, f]) => `${a}: ${f}`)
+                    .join('; ') || 'N/A';
+                row.insertCell().textContent = altFreqs;
+
+                row.insertCell().textContent = res.minor_allele;
+                row.insertCell().textContent = res.maf;
+                row.insertCell().textContent = res.population;
+
+                const errCell = row.insertCell();
+                errCell.textContent = res.error || '';
+                if (res.error) errCell.classList.add('error');
+            });
+
+            statusElement.textContent =
+                `Fetched ${results.length} unique variant${results.length > 1 ? 's' : ''}.`;
+            statusElement.className = '';
+            downloadBtn.disabled = false;
         }
+
 
         /**
          * Downloads the current results data as a JSON file.
@@ -476,10 +543,21 @@
             }
         }
 
-        // --- Event Listeners ---
-        rsidsInput.addEventListener('keypress', function (e) {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); fetchAndDisplaySnpData(); }
+        // Event Listeners
+        inputModeRadios.forEach(radio =>
+            radio.addEventListener('change', () => {
+                rsidsInput.parentElement.style.display  = radio.value === 'rsid' ? '' : 'none';
+                coordsInput.parentElement.style.display = radio.value === 'coord' ? '' : 'none';
+            })
+        );
+
+        coordsInput.addEventListener('keypress', e => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                fetchAndDisplaySnpData();
+            }
         });
+
 
     </script>
 
