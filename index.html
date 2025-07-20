@@ -31,6 +31,10 @@
             /* Keep header visible */
         }
 
+        tr.error-row td {
+            background: #ffecec;
+        }
+
         pre {
             background-color: #eee;
             padding: 10px;
@@ -92,7 +96,7 @@
     <div class="input-group">
         <label for="rsidsInput">Enter rsIDs (comma-separated):</label><br>
         <textarea id="rsidsInput" rows="4"
-            cols="60">rs6983267, rs10993994, rs2981582, rs16969968, rs4939827, rs_does_not_exist, rs2736100, rs1447295, rs766173, rs889312</textarea>
+            cols="60">rs6983267, rs10993994, rs2981582, rs16969968, rs4939827, rs00000, rs2736100, rs1447295, rs766173, rs889312</textarea>
     </div>
 
     <div class="input-group build-options">
@@ -160,6 +164,7 @@
         const ENSEMBL_API_BASE = "https://rest.ensembl.org";
         const VARIATION_ENDPOINT = "/variation/human/";
         const MAX_CONCURRENCY = 10; // Limit concurrent requests under Ensembl's 15 req/s limit
+        const MAX_IDS_PER_POST = 200; // POST /variation batch size
         const currentBuild = () => document.querySelector('input[name="genomeBuild"]:checked').value;
 
 
@@ -175,12 +180,18 @@
         const downloadBtn = document.getElementById('downloadBtn');
 
         // Helpers
+        /**
+         * Executes a pool of tasks with a concurrency limit.
+         * @param {Array<Function>} tasks - Array of functions returning promises.
+         * @param {number} limit - Maximum number of concurrent tasks.
+         * @returns {Promise<Array>} - Resolves with an array of results.
+         */
         async function pool(tasks, limit = MAX_CONCURRENCY) {
             const running = [];
             const results = [];
 
-            for (const t of tasks) {
-                const p = t().then(r => {
+            for (const task of tasks) {
+                const p = task().then(r => {
                     running.splice(running.indexOf(p), 1);
                     return r;
                 });
@@ -194,6 +205,14 @@
             return Promise.all(results);
         }
 
+        /**
+         * Fetches data with retry logic for transient errors.
+         * @param {string} url - The URL to fetch.
+         * @param {object} options - Fetch options.
+         * @param {number} retries - Number of retries on failure.
+         * @param {number} backoff - Initial backoff time in milliseconds.
+         * @returns {Promise<Response>} - The fetch response.
+         */
         async function fetchRetry(url, options = {}, retries = 3, backoff = 800) {
             try {
                 const r = await fetch(url, options);
@@ -208,25 +227,51 @@
         }
 
         /**
-         * Fetches data for a single rsID from Ensembl.
-         * @param {string} rsid - The rsID to query.
-         * @param {string} targetPopulation - The population code.
-         * @param {string} targetBuild - The target genome build ('GRCh37' or 'GRCh38').
-         * @returns {Promise<object>} - A promise that resolves with the SNP data or an error object.
+         * Fetches SNP data for a batch of rsIDs from Ensembl.
+         * @param {Array<string>} rsidArr - Array of rsIDs to query (≤ MAX_IDS_PER_POST).
+         * @param {string} population - The population code (e.g. "1000GENOMES:phase_3:ALL").
+         * @returns {Promise<Array<object>>} - A promise that resolves with the SNP data. Resolves to `{"rs123": {...},
+         *      "rs456": {...}, …}`
          */
-        async function fetchSnpData(rsid, targetPopulation, targetBuild) {
-            const url = `${ENSEMBL_API_BASE}${VARIATION_ENDPOINT}${rsid}?pops=1`;
-            const headers = { "Content-Type": "application/json" };
+        async function fetchVariationBatch(rsidArr, population) {
+            const url = `${ENSEMBL_API_BASE}${VARIATION_ENDPOINT}?pops=1`;
+            const body = JSON.stringify({ ids: rsidArr });
 
-            // Initialize returned result structure
-            const resultTemplate = {
-                rsid: rsid,
+            const response = await fetchRetry(
+                url,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body
+                }
+            );
+
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(`HTTP ${response.status}: ${response.statusText}. ${text}`);
+            }
+
+            return response.json();
+        }
+
+        /**
+         * Converts raw Ensembl JSON for a single rsID into the flat object used by the results table.
+         *
+         * @param {string} rsid - The rsID of the SNP.
+         * @param {object} data - The SNP data from Ensembl.
+         * @param {string} targetPopulation - The population code for frequencies.
+         * @param {string} targetBuild - The genome build (e.g. 'GRCh37', 'GRCh38').
+         * @returns {object} - A formatted object with SNP information.
+         */
+        function mapVariationToDisplay(rsid, data, targetPopulation, targetBuild) {
+            // Prepare a template for the result
+            const template = {
+                rsid,
                 chromosome: 'N/A',
                 position: 'N/A',
                 build: targetBuild,
                 ref_allele: 'N/A',
                 ref_allele_freq: 'N/A',
-                alt_alleles_list: [],
                 alt_alleles_display: 'N/A',
                 alt_allele_freqs: {},
                 minor_allele: 'N/A',
@@ -235,205 +280,171 @@
                 error: null
             };
 
-            try {
-                const response = await fetchRetry(url, { headers });
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}. ${errorText}`);
-                }
-
-                const data = await response.json();
-                const currentResult = { ...resultTemplate };
-                currentResult.alt_allele_freqs = {};
-
-                // --- Extract Location and Alleles for the target build ---
-                let mappingFound = false;
-                let sourceMapping = null;
-
-                if (data.mappings && data.mappings.length > 0) {
-                    const targetMapping = data.mappings.find(m => m.assembly_name === targetBuild);
-
-                    if (targetMapping) {
-                        currentResult.chromosome = targetMapping.seq_region_name || 'N/A';
-                        currentResult.position = targetMapping.start || 'N/A';
-                        mappingFound = true;
-                        sourceMapping = targetMapping;
-                    } else {
-                        currentResult.chromosome = `N/A (${targetBuild})`;
-                        currentResult.position = `N/A (${targetBuild})`;
-                        sourceMapping = data.mappings[0];
-                    }
-
-                    if (sourceMapping && sourceMapping.allele_string) {
-                        const alleleString = sourceMapping.allele_string;
-                        if (alleleString && alleleString.includes('/')) {
-                            const alleles = alleleString.split('/');
-                            currentResult.ref_allele = alleles[0];
-                            currentResult.alt_alleles_list = alleles.slice(1);
-                            currentResult.alt_alleles_display = currentResult.alt_alleles_list.join(', ') || 'N/A';
-                        } else if (alleleString) {
-                            currentResult.ref_allele = alleleString; // Indel or single allele?
-                            currentResult.alt_alleles_list = [];
-                            currentResult.alt_alleles_display = 'N/A';
-                        }
-                    }
-                } else {
-                    currentResult.chromosome = 'N/A (No mapping)';
-                    currentResult.position = 'N/A (No mapping)';
-                }
-
-                // Fallback for ref allele if still not found
-                if (currentResult.ref_allele === 'N/A' && data.ancestral_allele) {
-                    currentResult.ref_allele = data.ancestral_allele;
-                }
-
-                // --- Extract Frequencies for the target population ---
-                let foundPopulationData = false;
-                if (data.populations && data.populations.length > 0) {
-                    const popAlleleFreqs = data.populations
-                        .filter(p => p.population === targetPopulation)
-                        .map(p => ({ allele: p.allele, frequency: parseFloat(p.frequency) }))
-                        .filter(p => !isNaN(p.frequency) && p.allele !== '-');
-
-                    if (popAlleleFreqs.length > 0) {
-                        foundPopulationData = true;
-                        let minFreq = 1.1;
-                        let currentMinorAllele = 'N/A';
-
-                        popAlleleFreqs.forEach(popAllele => {
-                            const freqStr = popAllele.frequency.toFixed(5);
-
-                            // -- Store Ref Allele Freq --
-                            if (popAllele.allele === currentResult.ref_allele) {
-                                currentResult.ref_allele_freq = freqStr;
-                            }
-                            // -- Store Alt Allele Freqs --
-                            if (currentResult.alt_alleles_list.includes(popAllele.allele)) {
-                                currentResult.alt_allele_freqs[popAllele.allele] = freqStr;
-                            }
-
-                            // -- Find Minor Allele and MAF (Lowest Freq > 0) --
-                            if (popAllele.frequency > 0 && popAllele.frequency < minFreq) {
-                                minFreq = popAllele.frequency;
-                                currentMinorAllele = popAllele.allele;
-                            }
-                        });
-
-                        // Finalize MAF/Minor Allele assignment
-                        if (currentMinorAllele !== 'N/A') {
-                            currentResult.maf = minFreq.toFixed(5);
-                            currentResult.minor_allele = currentMinorAllele;
-                        } else if (popAlleleFreqs.some(p => p.frequency === 0)) {
-                            currentResult.maf = '0.00000';
-                            currentResult.minor_allele = popAlleleFreqs.find(p => p.frequency > 0)?.allele || 'N/A (Monomorphic)';
-                        } else {
-                            currentResult.maf = 'No data > 0';
-                            currentResult.minor_allele = 'N/A';
-                        }
-
-                        // -- Check for Missing Frequencies --
-                        // Check Ref Freq
-                        if (currentResult.ref_allele !== 'N/A' && currentResult.ref_allele_freq === 'N/A') {
-                            currentResult.ref_allele_freq = 'N/A (Not Found)';
-                        }
-                        // Check Alt Freqs
-                        currentResult.alt_alleles_list.forEach(alt => {
-                            if (!(alt in currentResult.alt_allele_freqs)) {
-                                currentResult.alt_allele_freqs[alt] = 'N/A (Not Found)';
-                            }
-                        });
-
-                    }
-                }
-
-                if (!foundPopulationData) {
-                    currentResult.ref_allele_freq = 'N/A (Pop not found)';
-                    currentResult.alt_allele_freqs = {}; // Empty
-                    currentResult.maf = 'N/A (Pop not found)';
-                    currentResult.minor_allele = 'N/A (Pop not found)';
-                }
-
-                delete currentResult.alt_alleles_list;
-
-                return currentResult;
-
-            } catch (error) {
-                console.error(`Error fetching data for ${rsid}:`, error);
-                const errorResult = { ...resultTemplate, error: error.message };
-                delete errorResult.alt_alleles_list;
-                errorResult.alt_allele_freqs = {};
-                return errorResult;
+            // Check if data is valid
+            if (!data || data.error) {
+                template.error = data ? data.error : 'Variant not found';
+                return template;
             }
+
+            // Mapping location and alleles
+            const mapping = (data.mappings || []).find(m => m.assembly_name === targetBuild)
+                || (data.mappings || [])[0]
+                || null;
+
+            if (mapping) {
+                template.chromosome = mapping.seq_region_name || 'N/A';
+                template.position = mapping.start || 'N/A';
+
+                if (mapping.allele_string?.includes('/')) {
+                    const [ref, ...alts] = mapping.allele_string.split('/');
+                    template.ref_allele = ref;
+                    template.alt_alleles_display = alts.join(', ') || 'N/A';
+                    template._alt_list = alts;
+                } else if (mapping.allele_string) {
+                    template.ref_allele = mapping.allele_string;
+                }
+            }
+
+            // Fallback for ref allele if still not found
+            if (template.ref_allele === 'N/A' && data.ancestral_allele) {
+                template.ref_allele = data.ancestral_allele;
+            }
+
+            // Population frequencies
+            const popRows = (data.populations || [])
+                .filter(p => p.population === targetPopulation && p.allele !== '-')
+                .map(p => ({ allele: p.allele, freq: parseFloat(p.frequency) }))
+                .filter(p => !isNaN(p.freq));
+
+            let minFreq = 1.1, minorAllele = null;
+
+            popRows.forEach(({ allele, freq }) => {
+                const freqStr = freq.toFixed(5);
+
+                if (allele === template.ref_allele) {
+                    template.ref_allele_freq = freqStr;
+                } else {
+                    template.alt_allele_freqs[allele] = freqStr;
+                }
+
+                if (freq > 0 && freq < minFreq) {
+                    minFreq = freq;
+                    minorAllele = allele;
+                }
+            });
+
+            if (template._alt_list) {
+                template._alt_list.forEach(a => {
+                    if (!template.alt_allele_freqs.hasOwnProperty(a)) {
+                        template.alt_allele_freqs[a] = 'N/A'; // Ensure all alt alleles are represented
+                    }
+                });
+                delete template._alt_list;
+            }
+
+            if (minorAllele) {
+                template.maf = minFreq.toFixed(5);
+                template.minor_allele = minorAllele;
+            }
+
+            return template;
         }
 
         /**
-         * Parses input, triggers fetches, and displays results in the table.
+         * Parses user input, batches rsIDs into POST requests, calls the API with bounded concurrency, feeds every
+         * response through the mapping function, and renders results in the table.
          */
         async function fetchAndDisplaySnpData() {
             const inputText = rsidsInput.value.trim();
             const targetPopulation = populationSelect.value;
-            const targetBuild = currentBuild();
+            const targetBuild = document.querySelector('input[name="genomeBuild"]:checked').value;
 
             // Basic input validation
-            if (!inputText) { /* ... existing validation ... */ return; }
-            const rsids = inputText.split(',').map(id => id.trim()).filter(id => id.length > 0);
-            if (rsids.length === 0) { /* ... existing validation ... */ return; }
+            if (!inputText) {
+                alert("Please enter at least one rsID.");
+                return;
+            }
+            let rsids = inputText.split(',')
+                .map(id => id.trim())
+                .filter(id => id.length > 0 && /^rs\d+$/i.test(id));
 
-            // --- UI Update & Fetch ---
+            if (rsids.length === 0) {
+                alert("No valid rsIDs found.");
+                return;
+            }
+
+            // UI reset
             resultsBody.innerHTML = '';
-            statusElement.textContent = `Fetching data for ${rsids.length} SNP(s)... (Build: ${targetBuild}, Pop: ${targetPopulation})`;
+            statusElement.textContent = `Fetching data for ${rsids.length} SNP(s)... (Build ${targetBuild}, Pop ${targetPopulation})`;
             statusElement.className = 'loading';
             resultsTable.style.display = 'none';
             downloadBtn.disabled = true;
             currentResultsData = [];
 
-            const tasks = rsids.map(id => () => fetchSnpData(id, targetPopulation, targetBuild));
+            // De‑duplicate & chunk
+            rsids = [...new Set(rsids)]; // keep original order
+            const chunks = [];
+            for (let i = 0; i < rsids.length; i += MAX_IDS_PER_POST) {
+                chunks.push(rsids.slice(i, i + MAX_IDS_PER_POST));
+            }
 
+            // Batched POST calls
+            const batchTasks = chunks.map(ch => () => fetchVariationBatch(ch, targetPopulation));
+            let batchJsons;
             try {
-                const results = await pool(tasks);
-                currentResultsData = results; // Store for download
-
-                if (currentResultsData.length > 0) {
-                    resultsTable.style.display = '';
-                    results.forEach(result => {
-                        const row = resultsBody.insertRow();
-                        // Populate cells in order of the header
-                        row.insertCell().textContent = result.rsid;
-                        row.insertCell().textContent = result.chromosome;
-                        row.insertCell().textContent = result.position;
-                        row.insertCell().textContent = result.build;
-                        row.insertCell().textContent = result.ref_allele;
-                        row.insertCell().textContent = result.ref_allele_freq;
-                        row.insertCell().textContent = result.alt_alleles_display;
-                        // Format alt_allele_freqs object for display
-                        const altFreqsCell = row.insertCell();
-                        altFreqsCell.textContent = Object.entries(result.alt_allele_freqs)
-                            .map(([allele, freq]) => `${allele}: ${freq}`)
-                            .join('; ') || 'N/A';
-                        row.insertCell().textContent = result.minor_allele;
-                        row.insertCell().textContent = result.maf;
-                        row.insertCell().textContent = result.population;
-                        // Error cell
-                        const errorCell = row.insertCell();
-                        errorCell.textContent = result.error || '';
-                        if (result.error) { errorCell.classList.add('error'); }
-                    });
-                    statusElement.textContent = `Fetched data for ${results.length} SNP(s).`;
-                    statusElement.className = '';
-                    downloadBtn.disabled = false;
-                } else {
-                    statusElement.textContent = 'No results returned.';
-                    statusElement.className = '';
-                    resultsTable.style.display = 'none';
-                    downloadBtn.disabled = true;
-                }
-            } catch (error) {
-                console.error("Error during Promise.all:", error);
-                statusElement.textContent = 'An unexpected error occurred while fetching data batch.';
+                batchJsons = await pool(batchTasks); // uses the pool() helper
+            } catch (e) {
+                console.error("Error during batched fetch:", e);
+                statusElement.textContent = 'Batch request failed. See console.';
                 statusElement.className = 'error';
-                downloadBtn.disabled = true;
-                currentResultsData = [];
+                return;
+            }
+
+            // Flatten & transform
+            const variationDict = Object.assign({}, ...batchJsons); // merge all batches
+            const results = rsids.map(id =>
+                mapVariationToDisplay(id, variationDict[id], targetPopulation, targetBuild)
+            );
+
+            // Render
+            currentResultsData = results; // for download
+
+            if (results.length > 0) {
+                resultsTable.style.display = '';
+                results.forEach(res => {
+                    const row = resultsBody.insertRow();
+
+                    if (res.error) row.classList.add('error-row');
+
+                    row.insertCell().textContent = res.rsid;
+                    row.insertCell().textContent = res.chromosome;
+                    row.insertCell().textContent = res.position;
+                    row.insertCell().textContent = res.build;
+                    row.insertCell().textContent = res.ref_allele;
+                    row.insertCell().textContent = res.ref_allele_freq;
+
+                    row.insertCell().textContent = res.alt_alleles_display;
+
+                    const altFreqsCell = row.insertCell();
+                    altFreqsCell.textContent = Object.entries(res.alt_allele_freqs)
+                        .map(([a, f]) => `${a}: ${f}`)
+                        .join('; ') || 'N/A';
+
+                    row.insertCell().textContent = res.minor_allele;
+                    row.insertCell().textContent = res.maf;
+                    row.insertCell().textContent = res.population;
+
+                    const errCell = row.insertCell();
+                    errCell.textContent = res.error || '';
+                    if (res.error) errCell.classList.add('error');
+                });
+
+                statusElement.textContent = `Fetched ${results.length} unique variant${results.length > 1 ? 's' : ''}.`;
+                statusElement.className = '';
+                downloadBtn.disabled = false;
+            } else {
+                statusElement.textContent = 'No results returned.';
+                statusElement.className = '';
             }
         }
 
