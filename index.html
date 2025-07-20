@@ -503,9 +503,12 @@
                 row.insertCell().textContent = res.ref_allele_freq;
                 row.insertCell().textContent = res.alt_alleles_display;
 
-                const altFreqs = Object.entries(res.alt_allele_freqs)
-                    .map(([a, f]) => `${a}: ${f}`)
-                    .join('; ') || 'N/A';
+                const altFreqs = (() => {
+                    const txt = Object.entries(res.alt_allele_freqs)
+                        .map(([a, f]) => `${a}: ${f}`)
+                        .join('; ');
+                    return txt || 'N/A';
+                })();
                 row.insertCell().textContent = altFreqs;
 
                 row.insertCell().textContent = res.minor_allele;
